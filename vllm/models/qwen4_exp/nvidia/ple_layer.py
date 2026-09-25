@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """GPU-resident Qwen4Exp position-learning enhancement layers."""
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
+from typing import cast
 
 import torch
 from torch import nn
@@ -20,12 +21,14 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
 from vllm.transformers_utils.configs.qwen4_exp import (
     Qwen4ExpTextConfig,
 )
+from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.attention.backends.short_conv_attn import (
     PleShortConvAttentionBackend,
     PleShortConvAttentionMetadata,
 )
 
+from . import ple_mmap
 from .ngram_embedding import Qwen4ExpNGramEmbedding
 from .ops.ple import ple_conv, ple_gate
 
@@ -100,6 +103,7 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             vllm_config.scheduler_config.max_num_batched_tokens,
             data_parallel_rank=vllm_config.parallel_config.data_parallel_rank,
             prefix=f"{prefix}.ple_embedding",
+            layer_name=prefix,
             quant_config=quant_config,
             params_dtype=model_config.dtype,
         )
@@ -394,10 +398,16 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        input_ids: torch.Tensor,
-        query_start_loc: torch.Tensor,
-        ngram_context: torch.Tensor,
+        input_ids: torch.Tensor | None,
+        query_start_loc: torch.Tensor | None,
+        ngram_context: torch.Tensor | None,
     ) -> torch.Tensor:
+        # The reshape just below needs input_ids regardless of mmap staging
+        # or not, so this check cannot be deferred into ple_embedding like
+        # the query_start_loc/ngram_context checks are (those are only
+        # needed by the non-staged hashing branch).
+        if input_ids is None:
+            raise RuntimeError("PLE inputs were not prepared")
         input_ids = input_ids.reshape(-1)
         if input_ids.shape[0] != hidden_states.shape[0]:
             raise ValueError(

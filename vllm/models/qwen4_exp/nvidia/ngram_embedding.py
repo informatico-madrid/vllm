@@ -3,12 +3,14 @@
 """Qwen4Exp n-gram embeddings with device and pinned-host storage."""
 
 from collections.abc import Iterable
+from typing import cast
 
 import torch
 from torch import nn
 
 from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
+from vllm.utils.torch_utils import get_dtype_size
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
 )
@@ -25,6 +27,7 @@ from ..common.ngram_embedding import (
     Qwen4ExpPLEPinnedHostEmbedding,
     Qwen4ExpPLEUnquantizedEmbeddingMethod,
 )
+from . import ple_mmap
 from .ops.ple import ple_ngram_ids
 
 logger = init_logger(__name__)
@@ -146,6 +149,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         *,
         data_parallel_rank: int,
         prefix: str,
+        layer_name: str,
         quant_config: QuantizationConfig | None = None,
         params_dtype: torch.dtype | None = None,
     ) -> None:
@@ -207,39 +211,165 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         )
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
-        engram_config = get_current_vllm_config().engram_config
-        embedding_cls = (
-            Qwen4ExpPLEPinnedHostEmbedding
-            if engram_config is not None and engram_config.cpu_offload
-            else Qwen4ExpPLEDeviceEmbedding
-        )
-        self.ngram_embedding = embedding_cls(
-            padded_vocab_size,
-            self.head_dim,
-            params_dtype=params_dtype,
-            padding_size=divisor,
-            prefix=embedding_prefix,
-            embedding_method=embedding_quant_method,
-            num_ngram_heads=self.ngram_heads,
-            max_total_tokens=max_total_tokens,
-            data_parallel_rank=data_parallel_rank,
-        )
-        if self.ngram_embedding.supports_prefetch:
-            # The side-stream lookup outlives eager-break args, whose
-            # graph-pool storage later segments may reuse.
-            self._prefetch_ids = torch.empty(
-                max_total_tokens, self.ngram_heads, dtype=torch.long
+        # PLE mmap (VLLM_PLE_MMAP=1): the n-gram table stays on disk and
+        # V2 model state stages the needed rows into a per-layer buffer
+        # before the compiled/captured forward runs.
+        self._mmap_staging: torch.Tensor | None = None
+        if ple_mmap.enabled():
+            vllm_config = get_current_vllm_config()
+            ple_mmap.check_cudagraph_safety(vllm_config)
+            discovered_dtype = ple_mmap.validate_shards_for(
+                vllm_config.model_config, layer_name, self.head_dim
             )
-        weight = self.ngram_embedding.weight
-        logger.info(
-            "Initialized PLE embedding %s: quantization_method=%s, "
-            "weight_dtype=%s, weight_device=%s, pinned=%s",
-            embedding_prefix,
-            type(embedding_quant_method).__name__,
-            weight.dtype,
-            weight.device,
-            weight.is_pinned(),
+            self.ngram_embedding = ple_mmap.MmapNgramEmbedding(
+                padded_vocab_size, self.head_dim
+            )
+            if discovered_dtype is not None:
+                # Seed the placeholder's fallback dtype from validated shard
+                # headers now, before any weights stream, so a dummy load's
+                # V2 staging buffer (initialize_mmap_staging) allocates at
+                # the checkpoint's real dtype instead of the FP8 default.
+                self.ngram_embedding.torch_dtype = discovered_dtype
+            logger.info(
+                "Initialized PLE mmap embedding %s: rows served from disk "
+                "via mmap staging (VLLM_PLE_MMAP=1)",
+                embedding_prefix,
+            )
+        else:
+            engram_config = get_current_vllm_config().engram_config
+            embedding_cls = (
+                Qwen4ExpPLEPinnedHostEmbedding
+                if engram_config is not None and engram_config.cpu_offload
+                else Qwen4ExpPLEDeviceEmbedding
+            )
+            self.ngram_embedding = embedding_cls(
+                padded_vocab_size,
+                self.head_dim,
+                params_dtype=params_dtype,
+                padding_size=divisor,
+                prefix=embedding_prefix,
+                embedding_method=embedding_quant_method,
+                num_ngram_heads=self.ngram_heads,
+                max_total_tokens=max_total_tokens,
+                data_parallel_rank=data_parallel_rank,
+            )
+            if self.ngram_embedding.supports_prefetch:
+                # The side-stream lookup outlives eager-break args, whose
+                # graph-pool storage later segments may reuse.
+                self._prefetch_ids = torch.empty(
+                    max_total_tokens, self.ngram_heads, dtype=torch.long
+                )
+            weight = self.ngram_embedding.weight
+            logger.info(
+                "Initialized PLE embedding %s: quantization_method=%s, "
+                "weight_dtype=%s, weight_device=%s, pinned=%s",
+                embedding_prefix,
+                type(embedding_quant_method).__name__,
+                weight.dtype,
+                weight.device,
+                weight.is_pinned(),
+            )
+
+    def _require_mmap_embedding(self) -> ple_mmap.MmapNgramEmbedding:
+        if not isinstance(self.ngram_embedding, ple_mmap.MmapNgramEmbedding):
+            raise RuntimeError(
+                f"PLE mmap: {self.layer_name!r} is not using mmap staging"
+            )
+        return self.ngram_embedding
+
+    def _resolve_mmap_dtype(self) -> torch.dtype:
+        """Resolve this layer's PLE row dtype without allocating a buffer.
+
+        Prefers the attached table's dtype — the authoritative source once a
+        real load has streamed weights. Falls back to the placeholder's own
+        ``torch_dtype`` (derived from validated shard headers at
+        construction, or its FP8 default when construction never resolved a
+        model path) for a dummy load that has not attached a table.
+
+        Raises:
+            RuntimeError: a real (non-dummy) load already streamed weights
+                but ``build_tables`` never attached a table — fail closed
+                rather than silently stage zeros as if they were real rows.
+        """
+        embedding = self._require_mmap_embedding()
+        table = embedding.table
+        if table is not None:
+            return table.torch_dtype
+        if embedding.weights_streamed:
+            raise RuntimeError(
+                f"PLE mmap: {self.layer_name!r} streamed weights but never "
+                "attached a table before mmap staging was initialized"
+            )
+        return embedding.torch_dtype
+
+    def mmap_staging_nbytes(self, max_num_tokens: int) -> int:
+        """Bytes this layer's staging buffer would occupy at ``max_num_tokens``.
+
+        Used by V2 model state to compute the aggregate allocation preflight
+        BEFORE any layer's buffer is actually allocated.
+        """
+        dtype = self._resolve_mmap_dtype()
+        return max_num_tokens * self.ngram_heads * self.head_dim * get_dtype_size(dtype)
+
+    def initialize_mmap_staging(
+        self, max_num_tokens: int, device: torch.device
+    ) -> None:
+        """Allocate this layer's stable, non-persistent staged-row buffer.
+
+        Called once by V2 model state, after the aggregate allocation
+        preflight has already cleared every layer for allocation. The
+        buffer's address, dtype, and shape never change afterward; only its
+        contents are overwritten in place by ``prepare_mmap_rows`` /
+        ``prepare_dummy_mmap_rows``.
+        """
+        dtype = self._resolve_mmap_dtype()
+        self._mmap_staging = torch.zeros(
+            (max_num_tokens, self.ngram_heads, self.head_dim),
+            dtype=dtype,
+            device=device,
         )
+
+    def prepare_mmap_rows(
+        self,
+        input_ids: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        ngram_context: torch.Tensor,
+        actual_tokens: int,
+        padded_tokens: int,
+    ) -> None:
+        """Gather this layer's staged rows for the current real step.
+
+        V2 model state calls this from ``prepare_inputs``, BEFORE the
+        compiled/captured forward runs. ``input_ids``/``query_start_loc``/
+        ``ngram_context`` must already be sliced to actual (unpadded)
+        extents by the caller — this never gathers graph padding. Zeros
+        ``[actual_tokens:padded_tokens]`` every call so a smaller batch
+        reusing a larger graph's buffer never replays stale rows.
+        """
+        if self._mmap_staging is None:
+            raise RuntimeError(
+                f"PLE mmap: {self.layer_name!r} staging was never initialized"
+            )
+        embedding = self._require_mmap_embedding()
+        if actual_tokens > 0:
+            ngram_ids = self.compute_ngram_ids(
+                input_ids, query_start_loc, ngram_context
+            )
+            embedding.gather_into(ngram_ids, self._mmap_staging[:actual_tokens])
+        if padded_tokens > actual_tokens:
+            self._mmap_staging[actual_tokens:padded_tokens].zero_()
+
+    def prepare_dummy_mmap_rows(self, padded_tokens: int) -> None:
+        """Zero this layer's staged rows for a dummy/capture step.
+
+        No hashing, mmap file access, pinned allocation, or H2D copy —
+        dummy preparation performs no table access at all.
+        """
+        if self._mmap_staging is None:
+            raise RuntimeError(
+                f"PLE mmap: {self.layer_name!r} staging was never initialized"
+            )
+        self._mmap_staging[:padded_tokens].zero_()
 
     @staticmethod
     def _shift_precompute(
@@ -358,6 +488,19 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         ngram_context: torch.Tensor,
     ) -> torch.Tensor:
         embedding = self.ngram_embedding
+        if isinstance(embedding, ple_mmap.MmapNgramEmbedding):
+            if self._mmap_staging is None:
+                raise RuntimeError(
+                    "PLE mmap: input preparation did not initialize "
+                    f"{self.layer_name!r}; Model Runner V2 is required"
+                )
+            # Keep this symbolic under torch.compile: no int() and no
+            # .numel()-derived slicing, which is what specialized vLLM's
+            # dynamic dims into a ConstraintViolationError on
+            # query_start_loc.size()[0] under the old whole-forward custom
+            # op. A plain shape[0] read stays a SymInt when traced.
+            num_tokens = input_ids.reshape(-1).shape[0]
+            return self._mmap_staging[:num_tokens].flatten(-2)
         if embedding.supports_prefetch:
             return embedding(hidden_states)
         ngram_ids = self.compute_ngram_ids(input_ids, query_start_loc, ngram_context)
@@ -384,6 +527,25 @@ class Qwen4ExpNGramEmbedding(nn.Module):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load hash buffers and checkpoint-split embedding rows."""
+        embedding = self.ngram_embedding
+        if (
+            isinstance(embedding, ple_mmap.MmapNgramEmbedding)
+            and embedding.table is not None
+        ):
+            # Fail closed BEFORE touching `weights` at all: a same-path
+            # reload (build_tables' own model_path check never fires, since
+            # nothing about the path changed) would otherwise mutate
+            # weight_scale and discard this call's shards onto a module
+            # whose table+scale still belong to the load that already
+            # attached — silently pairing the new checkpoint's scale with
+            # the previous checkpoint's mmap rows.
+            raise RuntimeError(
+                f"PLE mmap: {self.layer_name!r} already has a table "
+                "attached from a previous load; calling load_weights again "
+                "on the same live module is unsupported — it would mix "
+                "this reload's rows with the already-attached checkpoint's "
+                "scale. Restart the engine to load different weights."
+            )
         persistent_buffers = {
             "layer_multipliers": self.layer_multipliers,
             "ngram_heads_offsets": self.ngram_heads_offsets,
@@ -405,6 +567,20 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                         f"{tuple(buffer.shape)}, got {tuple(loaded_weight.shape)}"
                     )
                 buffer.copy_(loaded_weight.to(device=buffer.device, dtype=buffer.dtype))
+                loaded.add(name)
+                continue
+            if (
+                isinstance(embedding, ple_mmap.MmapNgramEmbedding)
+                and name == "ngram_embedding.weight_scale"
+            ):
+                # The placeholder has no registered weight_scale Parameter for
+                # AutoWeightsLoader to find generically; register it directly,
+                # on whatever device the module's other buffers already live.
+                ple_mmap.set_weight_scale(
+                    embedding,
+                    loaded_weight,
+                    cast(torch.Tensor, self.layer_multipliers).device,
+                )
                 loaded.add(name)
                 continue
             if name.startswith(shard_prefix) and name.endswith(".weight"):
@@ -434,6 +610,17 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                         f"expected {expected_shape}, got "
                         f"{tuple(loaded_weight.shape)}"
                     )
+                if isinstance(embedding, ple_mmap.MmapNgramEmbedding):
+                    # Served from disk via mmap; the loader still streams
+                    # this shard transiently, but it is never retained.
+                    # weights_streamed distinguishes this real (non-dummy)
+                    # load from a --load-format dummy probe that never
+                    # calls load_weights at all — build_tables must attach
+                    # a real table before any forward, or the placeholder
+                    # raises instead of silently serving fp8 zeros.
+                    embedding.weights_streamed = True
+                    loaded.add("ngram_embedding.weight")
+                    continue
                 embedding.weight.weight_loader(
                     embedding.weight,
                     loaded_weight,
