@@ -133,6 +133,7 @@ def _itemsize(dtype_str: str) -> int:
     Raises:
         ValueError: named, in place of a bare KeyError, so a checkpoint with
             an unrecognized dtype fails with a clear message.
+
     """
     torch_dtype = _SAFETENSORS_TO_TORCH_DTYPE.get(dtype_str)
     if torch_dtype is None:
@@ -162,6 +163,7 @@ def parse_safetensors_header(path: str) -> tuple[dict, int]:
     Raises:
         ValueError: the header is truncated, exceeds the size cap, or any
             tensor's ``data_offsets`` fall outside the file.
+
     """
     file_size = os.path.getsize(path)
     with open(path, "rb") as f:
@@ -226,6 +228,7 @@ def discover_shards(model_path: str) -> dict[int, _LayerShards]:
             shape/dtype, or shards for one layer disagree on dtype/width.
         FileNotFoundError: the safetensors index references a missing file.
         OSError: a selected checkpoint file cannot be inspected.
+
     """
     paths = sorted(glob.glob(os.path.join(model_path, "*.safetensors")))
     paths = filter_duplicate_safetensors_files(
@@ -367,6 +370,7 @@ def _coalesce_runs(offsets: np.ndarray, row_bytes: int) -> list[tuple[int, int]]
 
     Returns:
         ``(file_offset, length)`` pairs covering exactly the input spans.
+
     """
     if offsets.size == 0:
         return []
@@ -542,6 +546,7 @@ class MmapPleTable:
             The coalesced run count, reported even when it exceeds the bound
             and nothing was issued — a silent skip would be indistinguishable
             from readahead being off.
+
         """
         total_runs = 0
         segments: list[tuple[int, np.ndarray]] = []
@@ -604,6 +609,7 @@ class MmapPleTable:
 
         Raises:
             IndexError: an id falls outside the table's row range.
+
         """
         start_t = time.monotonic()
         ids = np.ascontiguousarray(ids, dtype=np.int64).reshape(-1)
@@ -765,6 +771,7 @@ class MmapPleTable:
 
         Returns:
             Bytes actually read.
+
         """
         if max_bytes <= 0:
             return 0
@@ -882,6 +889,7 @@ def _stage_pinned(cpu_tensor: torch.Tensor) -> tuple[torch.Tensor, bool]:
         buffer holding ``cpu_tensor``'s values and ``engaged`` is True. If
         either the allocation or the copy into it raises, ``tensor`` is
         ``cpu_tensor`` itself and ``engaged`` is False.
+
     """
     try:
         staged = _pin_host_tensor(cpu_tensor)
@@ -1000,6 +1008,7 @@ class MmapNgramEmbedding(nn.Module):
             RuntimeError: no table is attached and a real (non-dummy) load
                 already streamed weights without ``build_tables`` ever
                 attaching one.
+
         """
         expected_shape = (*ids.shape, self.embedding_dim)
         if destination.device != ids.device:
@@ -1217,6 +1226,7 @@ def check_cudagraph_safety(vllm_config: VllmConfig) -> None:
 
     Raises:
         RuntimeError: Model Runner V2 is not active.
+
     """
     if not vllm_config.use_v2_model_runner:
         raise RuntimeError(
@@ -1271,6 +1281,7 @@ def _validate_layer_shards(
     Returns:
         The layer's validated ``scale_entry``, or ``None`` when the
         discovered dtype's descriptor has ``requires_scale=False``.
+
     """
     if layer_shards.cols != head_dim:
         raise RuntimeError(
@@ -1343,6 +1354,7 @@ def _validate_shard_placement(
         RuntimeError: an expected shard index is missing, a present shard
             index exceeds ``split_ngram_parts``, or a present shard's row
             count does not match what its index implies.
+
     """
     shard_size = (org_vocab_size + split_ngram_parts - 1) // split_ngram_parts
     num_expected_shards = min(
@@ -1407,6 +1419,7 @@ def validate_shards_for(
     Raises:
         RuntimeError: the model path resolves but shards are missing,
             wrong-dtype, wrong-width, or scale-less.
+
     """
     try:
         model_path = resolve_model_path(model_config)
@@ -1503,6 +1516,7 @@ def preflight_reload_check(
             indices, or a per-shard row count that disagrees with the
             already-staged layer's ``org_vocab_size``/``split_ngram_parts``
             even though dtype and width matched).
+
     """
     if weights_path is not None and has_weights_iterator:
         # A dedicated pre-pass, run before any other check below: this
@@ -1750,10 +1764,20 @@ def approve_reload(
     to validate against. Raises and grants nothing if the reload is unsafe.
 
     Args:
+        model: the model being reloaded (standalone causal LM or the
+            conditional-generation wrapper holding one).
+        compilation_config: the runner's compilation config; the granted
+            token is bound to it.
+        weights_path: path of the weights being loaded, if known.
+        is_checkpoint_format: whether the weights arrive in checkpoint
+            format.
+        has_weights_iterator: whether the loader drives the reload
+            through a weights iterator.
         inner_model_attr: name of `model`'s nested causal LM attribute
             (``"language_model"`` for `Qwen4ExpForConditionalGeneration`),
             granted a copy of the same token. `None` for a standalone
             `Qwen4ExpForCausalLM`, which has no nested model to share with.
+
     """
     preflight_reload_check(
         compilation_config,
@@ -1791,6 +1815,9 @@ def validate_reload_approval(
     so minting implies both return values are True.
 
     Args:
+        model: the model entering or validating the reload transaction.
+        compilation_config: the runner's compilation config the token is
+            bound to.
         inner_model_attr: forwarded to `_grant_reload_transaction` when
             this call mints a fresh transaction; see `approve_reload`.
 
@@ -1813,6 +1840,7 @@ def validate_reload_approval(
         LM invoked under an outer `Qwen4ExpForConditionalGeneration`
         transaction, which must defer every one of its (possibly repeated)
         table-build opportunities to the outer wrapper's own return.
+
     """
     token = getattr(model, _RELOAD_APPROVAL_ATTR, None)
     if token is not None:
@@ -1902,6 +1930,7 @@ def build_tables(
             now — reload_weights repointing ``model_config`` at a new
             checkpoint is unsupported; serving checkpoint A's mmap rows
             against checkpoint B's scale would silently corrupt output.
+
     """
     model_path = resolve_model_path(model_config)
 

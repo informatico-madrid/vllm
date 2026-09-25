@@ -2,8 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """GPU-resident Qwen4Exp position-learning enhancement layers."""
 
-from collections.abc import Iterable, Sequence
-from typing import cast
+from collections.abc import Sequence
 
 import torch
 from torch import nn
@@ -21,14 +20,12 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
 from vllm.transformers_utils.configs.qwen4_exp import (
     Qwen4ExpTextConfig,
 )
-from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.attention.backends.short_conv_attn import (
     PleShortConvAttentionBackend,
     PleShortConvAttentionMetadata,
 )
 
-from . import ple_mmap
 from .ngram_embedding import Qwen4ExpNGramEmbedding
 from .ops.ple import ple_conv, ple_gate
 

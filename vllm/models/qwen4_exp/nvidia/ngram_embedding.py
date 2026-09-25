@@ -10,7 +10,6 @@ from torch import nn
 
 from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
-from vllm.utils.torch_utils import get_dtype_size
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
 )
@@ -18,6 +17,7 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.transformers_utils.configs.qwen4_exp import (
     Qwen4ExpTextConfig,
 )
+from vllm.utils.torch_utils import get_dtype_size
 
 from ..common.ngram_embedding import (
     Qwen4ExpPLEDeviceEmbedding,
@@ -290,6 +290,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             RuntimeError: a real (non-dummy) load already streamed weights
                 but ``build_tables`` never attached a table — fail closed
                 rather than silently stage zeros as if they were real rows.
+
         """
         embedding = self._require_mmap_embedding()
         table = embedding.table
