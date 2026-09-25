@@ -1085,6 +1085,25 @@ class MmapNgramEmbedding(nn.Module):
             pinned=pinned_engaged,
         )
 
+    def dequantize(
+        self, embeddings: torch.Tensor, output_dtype: torch.dtype
+    ) -> torch.Tensor:
+        """Dequantize staged rows — same contract as the resident
+        ``Qwen4ExpPLEEmbedding.dequantize``, so
+        ``Qwen4ExpPLELayer._dequantize_embeddings`` can call either storage
+        identically. FP8 rows carry a single global ``weight_scale``;
+        unquantized rows (e.g. BF16 checkpoints) are only cast.
+        """
+        if embeddings.dtype != torch.float8_e4m3fn:
+            # Unquantized (e.g. BF16) tables carry no scale to apply — just
+            # cast to the output dtype, same as the fp8 branch's final cast.
+            return embeddings.to(output_dtype)
+        if not self.weight_scale_loaded:
+            raise RuntimeError("FP8 PLE embedding is missing its global scale")
+        if self.weight_scale.device != embeddings.device:
+            raise RuntimeError("FP8 PLE embedding scale must be on the output device")
+        return embeddings.to(output_dtype) * self.weight_scale.to(output_dtype)
+
     def forward(self, ids: torch.Tensor) -> torch.Tensor:
         """Allocate a fresh destination and delegate to :meth:`gather_into`.
 
