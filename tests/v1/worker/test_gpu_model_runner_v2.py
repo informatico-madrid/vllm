@@ -356,6 +356,8 @@ def test_execute_model_dummy_run_uses_prepare_runtime_dummy_inputs_not_prepare_i
         num_tokens=num_tokens,
         num_tokens_after_padding=num_tokens,
         is_padding=None,
+        idx_mapping=torch.arange(1),
+        req_ids=["dummy"],
     )
     fake_batch_desc = SimpleNamespace(
         num_tokens=num_tokens,
@@ -363,6 +365,7 @@ def test_execute_model_dummy_run_uses_prepare_runtime_dummy_inputs_not_prepare_i
         max_query_len=num_tokens,
         cg_mode=CUDAGraphMode.NONE,
         num_active_loras=0,
+        num_ubatches=1,
     )
 
     runner: Any = GPUModelRunner.__new__(GPUModelRunner)
@@ -381,10 +384,23 @@ def test_execute_model_dummy_run_uses_prepare_runtime_dummy_inputs_not_prepare_i
         record_batch=lambda *a, **kw: None, forward_start=lambda: None
     )
     runner.model_config = None
+    runner.parallel_config = ParallelConfig()
+    runner.decode_query_len = None
+    runner.ubatch_runner = None
+    runner.pcp_manager = None
+    runner.attn_groups = []
+    runner.block_tables = None
+    runner.cp_interleave = 1
+    runner.dcp_rank = 0
+    runner.dcp_size = 1
+    runner.kv_cache_config = None
+    runner.lora_state = None
+    runner.max_model_len = 8192
+    runner.observability_config = None
     runner.vllm_config = SimpleNamespace(
         parallel_config=ParallelConfig(), compilation_config=CompilationConfig()
     )
-    runner.kv_connector = SimpleNamespace(pre_forward=lambda scheduler_output: None)
+    runner.kv_connector = SimpleNamespace(pre_forward=lambda *a, **kw: None)
     runner.model = _fake_model
 
     monkeypatch.setattr(
