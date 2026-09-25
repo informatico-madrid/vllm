@@ -66,6 +66,29 @@ def test_prepare_attn_forwards_positions(monkeypatch: pytest.MonkeyPatch) -> Non
     assert build_attn_metadata.call_args.kwargs["positions"] is positions
 
 
+def test_prepare_runtime_dummy_inputs_default_delegates_to_prepare_inputs() -> None:
+    """The ``ModelState`` base's default body -- inherited unchanged by every
+    model state that has no field needing separate dummy-batch handling,
+    e.g. ``MambaHybridModelState`` -- must delegate to ``prepare_inputs``
+    with the same (input_batch, req_states) and return its result as-is."""
+    state = object.__new__(MambaHybridModelState)
+    input_batch = object()
+    req_states = object()
+    sentinel = {"input_ids": "sentinel"}
+    calls = []
+
+    def _prepare_inputs(ib: object, rs: object) -> dict:
+        calls.append((ib, rs))
+        return sentinel
+
+    state.prepare_inputs = _prepare_inputs
+
+    result = state.prepare_runtime_dummy_inputs(input_batch, req_states)
+
+    assert result is sentinel
+    assert calls == [(input_batch, req_states)]
+
+
 def test_padded_prompt_tail_builds_as_spec_decode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
